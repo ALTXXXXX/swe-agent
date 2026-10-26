@@ -17,7 +17,8 @@ class Agent:
         self.messages = [
             {
                 "role": "system",
-                "content": "You are a helpful assistant"
+                "content": f"You are a coding assistant. Current working directory: {os.getcwd()}. "
+                   f"Use relative paths or absolute paths under this directory."
             }
         ]
 

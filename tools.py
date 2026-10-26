@@ -1,4 +1,5 @@
 import json
+from math import trunc
 from pathlib import Path
 tool_definitions = [
     {
@@ -62,6 +63,44 @@ tool_definitions = [
             "required": ["file_path", "old_string", "new_string"]
         }
     }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "write_file",
+        "description": "将内容写入指定文件。文件不存在则自动创建（含父目录）；已存在则整体覆盖原内容。适合创建新文件或重写整个文件。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "目标文件路径，相对当前工作目录或绝对路径"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "要写入的完整文件内容"
+                }
+            },
+            "required": ["file_path", "content"]
+        }
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "list_files",
+        "description": "列出指定目录下的所有文件和子目录名称。用于了解项目结构、查找文件位置。返回结果中目录前有 [dir] 标识。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "要列出内容的目录路径，\".\" 表示当前工作目录"
+                }
+            },
+            "required": ["file_path"]
+        }
+    }
 }
     
 
@@ -84,6 +123,8 @@ def _read_file(inp: dict) -> str:
         return numbered
     except Exception as e:
         return f"错误的文件读取：{e}"
+
+
 
 
 def _edit_file(inp: dict) -> str:
@@ -110,14 +151,38 @@ def _edit_file(inp: dict) -> str:
     except Exception as e:
          return f"Error editing file: {e}"
 
+def _write_file(inp: dict) -> str:
+    try:
+        path = Path(inp["file_path"])
+        path.parent.mkdir(parents=True,exist_ok=True)
+        path.write_text(inp["content"])
+        lines = inp["content"]
+        line_count = len(lines)
+        preview = "\n".join(
+        f"{i+1:4d} | {l}" for i,l in enumerate(lines[:30])
+        )
+        trunc = f"\n  ... ({line_count} lines total)" if line_count > 30 else ""
+        return f"Successfully wrote to {inp['file_path']} ({line_count} lines)\n\n{preview}{trunc}"
+    except Exception as e:
+        return f"Error writing file: {e}"
+
+def _list_files(inp: dict) -> str:
+    path = Path(inp["file_path"])
+    if not path.exists():
+        return f"Error: directory not found: {path}"
+    entries = sorted(path.iterdir(),key= lambda p: (p.is_file(),p.name))
+    return "\n".join(
+       f"{'[dir]' if e.is_dir() else ''}{e.name}" for e in entries
+    )
+
 
 
 tool_handlers = {
     "read_file": _read_file,
     "edit_file": _edit_file,
-    # "write_file": _write_file,
+    "write_file": _write_file,
     # "edit_file": _edit_file,
-    # "list_files": _list_files,
+    "list_files": _list_files,
     # "grep_search": _grep_search,
     # "run_shell": _run_shell,
     "get_weather": get_weather
@@ -140,18 +205,6 @@ def execute_tool(name: str, inp: dict) -> str:
 
     except Exception as e:
         return f"工具执行失败： {e}"
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
