@@ -1,5 +1,6 @@
 import json
 from math import trunc
+from nt import error
 from pathlib import Path
 import subprocess
 import re
@@ -155,6 +156,27 @@ tool_definitions = [
         }
     }
 },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": "抓取一个网页 URL 并返回其文本内容。HTML 页面会自动去除标签只留正文。用于查文档、看网页内容。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "要抓取的完整 URL，必须以 http:// 或 https:// 开头"
+                    },
+                    "max_length": {
+                        "type": "integer",
+                        "description": "返回内容的最大字符数，默认 50000"
+                    }
+                },
+                "required": ["url"]
+            }
+        }
+    },
  
 
 ]
@@ -178,7 +200,47 @@ def _read_file(inp: dict) -> str:
         return f"错误的文件读取：{e}"
 
 
+def _web_fetch(inp: dict) -> str:
+    url = inp["url"]
+    max_length = inp.get("max_length",50000)
+    if not url.startswith(("http://", "https://")):
+        return f"Error: only http/https is supported, got: {url}"
+    
+    try:
+        req = urllib.request.Request(url,headers={"User-Agent": "my-sweagent/0.1"})
+        with urllib.request.urlopen(req,timeout=30) as resp:
+            status = resp.status
+            content_type = resp.headers.get("Content-Type","")
+            raw = resp.read()    
+    except urllib.error.HTTPError as e:
+        return f"HTTP error: {e.code} {e.reason}"
+    except Exception as e:
+        return f"Error fetching {url}: {e}"
 
+    #对raw进行解析，先按照utf-8，不行就gbk  
+    try:
+
+        text =  raw.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode("gbk")
+        except UnicodeDecodeError:
+            text = raw.decode("utf-8",errors="replace")
+    
+    #数据清洗，剥脚本/样式 → 标签变空格 → 实体还原 → 压缩空
+    if "html" in content_type.lower():
+        text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", "", text)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = html.unescape(text)
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        
+    
+    #判断文本大小，大于maxLength就截断
+    if len(text) > max_length:
+        text = text[:max_length] + f"\n\n[... truncated at {max_length} characters]"
+    #返回结果
+    return text or "(empty response)"
 
 def _edit_file(inp: dict) -> str:
     try:
@@ -298,7 +360,8 @@ tool_handlers = {
     "list_files": _list_files,
     "grep_search": _grep_search,
     "run_shell": _run_shell,
-    "get_weather": get_weather
+    "get_weather": get_weather,
+    "web_fetch": _web_fetch
 
 }
 

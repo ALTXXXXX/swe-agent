@@ -6,6 +6,7 @@ from tools import tool_definitions,execute_tool
 import subprocess
 import os
 import json
+from prompt import build_static_system_prompt,build_dynamic_system_prompt,build_user_context_reminder
 
 
 load_dotenv()
@@ -18,8 +19,7 @@ class Agent:
         self.messages = [
             {
                 "role": "system",
-                "content": f"You are a coding assistant. Current working directory: {os.getcwd()}. "
-                   f"Use relative paths or absolute paths under this directory."
+                "content":build_static_system_prompt() + build_dynamic_system_prompt()
             }
         ]
 
@@ -44,6 +44,12 @@ class Agent:
     #处理一轮用户对话
     def chat_once(self,user_message):
         history_len = len(self.messages)
+       
+        # reminder拼接到第一条用户消息前面
+        if history_len == 1:
+            reminder = build_user_context_reminder()
+            user_message = f"{reminder}\n\n{user_message}"
+
         self.messages.append({"role": "user", "content": user_message})
         while True:
             try:
@@ -84,6 +90,7 @@ class Agent:
     def run(self):
         while True:
             user_message = input("User: ")
+
             if user_message.strip().lower() in ("exit",""):
                 print("Bye!")
                 break
