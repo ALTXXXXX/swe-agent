@@ -3,6 +3,7 @@
 from openai import OpenAI
 from dotenv import load_dotenv
 from tools import tool_definitions,execute_tool
+import subprocess
 import os
 import json
 
@@ -90,6 +91,6 @@ class Agent:
                                     
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":   
     agent = Agent()
     agent.run()

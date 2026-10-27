@@ -1,6 +1,13 @@
 import json
 from math import trunc
 from pathlib import Path
+import subprocess
+import re
+import html
+import urllib.request
+import urllib.error
+
+from sys import stdout
 tool_definitions = [
     {
                     "type": "function",
@@ -101,8 +108,54 @@ tool_definitions = [
             "required": ["file_path"]
         }
     }
-}
-    
+},
+{
+    "type": "function",
+    "function": {
+        "name": "run_shell",
+        "description": "执行系统 shell 命令并返回输出。Windows 下使用 cmd.exe 语法。谨慎使用删除/格式化等破坏性命令。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "要执行的 shell 命令"
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "超时时间（秒），默认 30"
+                }
+            },
+            "required": ["command"]
+        }
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "grep_search",
+        "description": "在指定目录下递归搜索文本内容，返回匹配的文件路径、行号和该行内容。用于定位代码位置、查找某个函数或变量的定义与用法。结果最多返回 100 行。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "要搜索的文本内容"
+                },
+                "path": {
+                    "type": "string",
+                    "description": '搜索的起始目录，默认为当前工作目录 "."'
+                },
+                "include": {
+                    "type": "string",
+                    "description": '只搜索匹配该模式的文件，如 "*.py" 只搜 Python 文件'
+                }
+            },
+            "required": ["pattern"]
+        }
+    }
+},
+ 
 
 ]
 #执行天气查询的工具
@@ -167,13 +220,74 @@ def _write_file(inp: dict) -> str:
         return f"Error writing file: {e}"
 
 def _list_files(inp: dict) -> str:
-    path = Path(inp["file_path"])
-    if not path.exists():
-        return f"Error: directory not found: {path}"
-    entries = sorted(path.iterdir(),key= lambda p: (p.is_file(),p.name))
+    d =Path(inp["file_path"])
+    if not d.exists():
+        return f"Error: directory not found: {d}"
+    entries = sorted(d.iterdir(),key= lambda p: (p.is_file(),p.name))
     return "\n".join(
-       f"{'[dir]' if e.is_dir() else ''}{e.name}" for e in entries
+       f"{'[dir] ' if e.is_dir() else ''}{e.name}"
+        for e in entries
     )
+
+
+def _grep_search(inp: dict) -> str:
+    try:
+        # inp：{pattern, path(可选), include(可选：只搜某种文件，如 "*.py)}
+        pattern = inp["pattern"]
+        path = inp.get("path") or "."
+        include = inp.get("include")
+        # 拼命令
+        args = ["grep","--line-number","--color=never","-r"]
+        if include:
+            args.append(f"--include={include}")
+        args.extend(["--",pattern,path])
+        # 调用subprocess执行命令
+        result =subprocess.run(args,capture_output=True,timeout=10)
+        #看returncode
+        if result.returncode == 1:
+            return "No matches found"
+        if result.returncode != 0:
+            return f"Error: {_decode_output(result.stderr)}"  # 退出码 2 = 真出错了
+        #截断结果，截断到100行，主要为了防止上下文被撑爆
+        stdout = _decode_output(result.stdout)
+        lines = [l for l in stdout.split("\n") if l]
+        output = "\n".join(lines[:100])
+        if len(lines) > 100:
+            output += f"\n... and {len(lines)-100} more matches"
+        return output
+    except Exception as e:
+        return f"Error: {e}"
+
+def _decode_output(data: bytes) -> str:
+    for enc in ("utf-8", "gbk"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            pass  
+    return data.decode("utf-8",errors="replace")
+
+
+
+def _run_shell(inp:dict) -> str:
+    try:
+        timeout = inp.get("timeout", 30)
+        result = subprocess.run(
+            inp["command"],
+            shell=True,
+            capture_output=True,
+            timeout=timeout
+        )
+        stdout = _decode_output(result.stdout)
+        stderr = _decode_output(result.stderr)
+        if result.returncode != 0:
+            stderr = f"\nStderr: {stderr}"  if stderr else ""
+            stdout = f"\nStdout: {stdout}" if stdout else ""
+            return f"Command failed (exit code {result.returncode}){stdout}{stderr}"
+        return stdout or "(no output)"    
+    except subprocess.TimeoutExpired:
+        return f"Command timed out after {inp.get('timeout', 30)}s"
+    except Exception as e:
+        return f"Error: {e}"
 
 
 
@@ -181,10 +295,9 @@ tool_handlers = {
     "read_file": _read_file,
     "edit_file": _edit_file,
     "write_file": _write_file,
-    # "edit_file": _edit_file,
     "list_files": _list_files,
-    # "grep_search": _grep_search,
-    # "run_shell": _run_shell,
+    "grep_search": _grep_search,
+    "run_shell": _run_shell,
     "get_weather": get_weather
 
 }
