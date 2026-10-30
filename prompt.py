@@ -111,5 +111,5 @@ def build_user_context_reminder() -> str:
     if agents_md:
         reminder += f"\n{agents_md}\n\n"
     reminder += f"# currentDate\nToday's date is {today}.\n"
-    reminder += "<system-reminder>"
+    reminder += "</system-reminder>"
     return reminder
