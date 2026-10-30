@@ -366,8 +366,6 @@ tool_handlers = {
 
 
 def execute_tool(name: str, inp: dict) -> str:
-    print(f"\n[TOOL CALLED] {name}")
-    print(f"[TOOL INPUT] {inp}")
 
     try:
         
