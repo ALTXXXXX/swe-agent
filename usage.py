@@ -38,8 +38,16 @@ def from_openai(u) -> TokenUsage:
     )
 
 
+def from_anthropic(u) -> TokenUsage:
+    if u is None:
+        return TokenUsage()
 
-
+    return TokenUsage(
+        uncached_input=u.input_tokens,
+        cache_read=u.cache_read_input_tokens or 0,
+        cache_write=u.cache_creation_input_tokens or 0,
+        output=u.output_tokens,
+    )   
 
 def _cached_tokens(u) -> int:
     details = getattr(u, "prompt_tokens_details", None)
@@ -58,3 +66,4 @@ def format_usage(usage: TokenUsage) -> str:
         f"本轮 {total:,} "
         f"(↑{usage.prompt_tokens:,} ↓{usage.output:,})"
     )
+

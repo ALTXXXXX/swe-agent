@@ -112,4 +112,4 @@ def build_user_context_reminder() -> str:
         reminder += f"\n{agents_md}\n\n"
     reminder += f"# currentDate\nToday's date is {today}.\n"
     reminder += "</system-reminder>"
-    return reminder
+    return reminder   

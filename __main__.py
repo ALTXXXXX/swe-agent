@@ -5,6 +5,8 @@ from agent import Agent
 from session import load_session, save_session,list_sessions,get_latest_session_id
 from dotenv import load_dotenv
 load_dotenv()    
+print("OPENAI_API_KEY:", bool(os.environ.get("OPENAI_API_KEY")))
+print("ANTHROPIC_API_KEY:", bool(os.environ.get("ANTHROPIC_API_KEY")))
 def parse_args()-> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="mini-agent", add_help=False)
     parser.add_argument("prompt", nargs="*")
@@ -50,18 +52,16 @@ def main() -> None:
     if not resolved_api_key:
         print("Error: API key is required.", file=sys.stderr)
         sys.exit(1)  
-
-    if provider == "anthropic":
-        print("Error: Anthropic provider is not implemented yet. Please use OPENAI_API_KEY for now.", file=sys.stderr)
-        sys.exit(1)          
+  
     api_base = args.api_base or env_base_url
+    print(f"{provider}\n\{resolved_api_key}\n{env_base_url}\n")
     agent = Agent(
         provider = provider,
         permission_mode=permission_mode,
         model=model,
         thinking=args.thinking,
         max_cost_usd=args.max_cost,
-        max_turns=args.max_turns,
+        max_turns=args.max_turns or 10,
         api_key=resolved_api_key,
         api_base=api_base)
 
