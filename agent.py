@@ -2,7 +2,6 @@
 
 from pathlib import Path
 import sys
-import anthropic
 from anthropic.resources import messages
 from openai import OpenAI, chat
 from dotenv import load_dotenv
@@ -23,7 +22,7 @@ from zoneinfo import ZoneInfo
 from rich.console import Console
 from anthropic import Anthropic
 from rich.text import Text
-from ui import print_tool_call, print_tool_result
+from ui import print_tool_call, print_tool_result, print_text_delta
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 load_dotenv()
 
@@ -46,6 +45,7 @@ class Agent:
     api_base: str | None = None,
     api_key: str | None = None,
     thinking: bool = False,
+    stream: bool = True,             # 是否流式输出（目前仅 Anthropic 生效）
     max_tokens: int = 4096,          # Anthropic 必填参数，OpenAI 忽略
     max_cost_usd: float | None = None,
     max_turns: int | None = None,
@@ -60,6 +60,7 @@ class Agent:
         self.api_base = api_base
         self.api_key = api_key
         self.thinking = thinking
+        self.stream = stream
         self.max_tokens = max_tokens
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
@@ -73,7 +74,6 @@ class Agent:
         self.tools = custom_tools if custom_tools is not None else tool_definitions
         # Anthropic 使用独立 schema，待 adapters.to_anthropic_tools 实现后填充
         self.anthropic_tools = self.convert_to_anthropic_tools()
-
         if self.provider == "openai":
             self.openai_client = OpenAI(
                 api_key=api_key,
@@ -117,6 +117,7 @@ class Agent:
             }
         ]
         self.anthropic_messages = []
+
 
     @property
     def _active_messages(self) -> list[dict]:
@@ -287,10 +288,15 @@ class Agent:
 
     def chat_once(self,user_message):
         if self.provider == "openai":
-            self._chat_openai(user_message)
+            if self.stream:
+                self._chat_openai_stream(user_message)
+            else:
+                self._chat_openai(user_message)
         elif self.provider == "anthropic":
-            print("anthropic调用")
-            self._chat_anthropic(user_message)
+            if self.stream:
+                self._chat_anthropic_stream(user_message)
+            else:
+                self._chat_anthropic(user_message)
 
     def convert_to_anthropic_tools(self):
         """讲openai格式的工具定义转换为Anthropic的格式"""
@@ -306,6 +312,33 @@ class Agent:
         return anthropic_tools
 
 
+    def _run_anthropic_tools(self, response) -> list[dict]:
+        """执行响应中的 tool_use 块，返回可直接回传的 tool_result 列表。"""
+        tool_result = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+
+            function_name = block.name
+            arguments = block.input
+            call_id = block.id
+            try:
+                # 1. 展示工具调用
+                print_tool_call(function_name, arguments)
+                result = execute_tool(function_name, arguments)
+                # 3. 展示执行结果
+                print_tool_result(function_name, result)
+            except Exception as e:
+                result = f"Error: 工具执行失败：{e}"
+
+            tool_result.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": str(result),
+                }
+            )
+        return tool_result
 
 
     def _chat_anthropic(self,user_message):
@@ -320,8 +353,12 @@ class Agent:
             "content":user_message
         })
         #agent loop循环
-
-        for i in range(self.max_turns):
+        self.turn_count = 0
+        while True:
+            if self.max_turns is not None and self.turn_count >= self.max_turns:
+                print(f"已达到最大轮数（{self.max_turns}），强制停止。")
+                return
+            self.turn_count += 1
             #调用messagesapi
             response = self.call_anthropic(
                 messages = self.anthropic_messages,
@@ -345,33 +382,9 @@ class Agent:
                 self.turn_usage = TokenUsage()
                 self.turn_cost_usd = 0.0
                 return
-            #涉及到工具调用，则先定义一个tool_result列表，然后for循环遍历block
+            #涉及到工具调用，执行工具并拼装 tool_result
             if response.stop_reason == "tool_use":
-                tool_result = []
-                for block in response.content:
-                    #当block的type是tool_use,则解析，获取function_name，和arguments
-                    if block.type == "tool_use":
-                        function_name = block.name
-                        arguments = block.input
-                        call_id =  block.id
-                #然后execute_tool()执行工具，得到result
-                        try:
-                            # 1. 展示工具调用
-                            print_tool_call(function_name, arguments)
-                            result = execute_tool(function_name,arguments)
-                            # 3. 展示执行结果
-                            print_tool_result(function_name, result)
-                        except Exception as e:
-                                result = f"Error: 工具执行失败：{e}"
-                #把result消息拼接，装到tool_result列表
-                        tool_result.append(
-                            {
-                                "type":"tool_result",
-                                "tool_use_id":call_id,
-                                "content":str(result)
-                            }
-                        )          
-                #for遍历结束，把tool_result拼接到messages消息，然后tool_result清空
+                tool_result = self._run_anthropic_tools(response)
                 if tool_result:
                     self.anthropic_messages.append({
                         "role":"user",
@@ -382,9 +395,112 @@ class Agent:
                 return                
             print(f"模型停止生成，原因：{response.stop_reason}")
             return
-        print("超过最大调用次数！")         
 
-        
+
+    def _chat_anthropic_stream(self,user_message):
+        history_len = len(self.anthropic_messages)
+        if history_len == 0:
+            #reminder拼接到第一条用户消息前面
+            remind = build_user_context_reminder()
+            user_message = f"{remind}\n\n{user_message}"
+
+        self.anthropic_messages.append({
+            "role":"user",
+            "content":user_message
+        })
+
+        #agent loop循环
+        self.turn_count = 0
+        while True:
+            if self.max_turns is not None and self.turn_count >= self.max_turns:
+                print(f"已达到最大轮数（{self.max_turns}），强制停止。")
+                return
+            self.turn_count += 1
+
+            try:
+                response = self.call_anthropic_stream(
+                    messages = self.anthropic_messages,
+                    tools=self.anthropic_tools,
+                    on_text=print_text_delta
+                )
+            except KeyboardInterrupt:
+                console.print()
+                print("已中断本轮对话")
+                del self.anthropic_messages[history_len:]
+                return
+            except Exception as e:
+                console.print()
+                print(f"调用失败：{e}")
+                del self.anthropic_messages[history_len:]
+                return
+            self.total_api_calls += 1
+
+            #统计token消耗（最终消息里的 usage 已是完整值，只记一次）
+            if response.usage is not None:
+                self._record_usage(response.usage)
+
+            self.anthropic_messages.append(
+                response.model_dump(include={"role","content"})
+            )
+            #流式文本可能没有以换行结尾，后面接工具输出/usage 前补一个换行
+            has_text = any(
+                block.type == "text" and block.text
+                for block in response.content
+            )
+            if has_text:
+                console.print()
+
+            if response.stop_reason == "end_turn":
+                self.show_usage()
+                self.turn_usage = TokenUsage()
+                self.turn_cost_usd = 0.0
+                return
+
+            if response.stop_reason == "tool_use":
+                tool_result = self._run_anthropic_tools(response)
+                if tool_result:
+                    self.anthropic_messages.append({
+                        "role":"user",
+                        "content":tool_result
+                    })
+                    continue
+                print("模型请求工具调用，但没有找到 tool_use 内容块")
+                return
+
+            print(f"模型停止生成，原因：{response.stop_reason}")
+            return
+
+
+    def _run_openai_tools(self, message) -> list[dict]:
+        """解析并执行 message.tool_calls，返回 tool 角色消息列表。"""
+        tool_messages = []
+        for tool_call in message.tool_calls:
+            function_name = tool_call.function.name
+            try:
+                arguments = json.loads(
+                    tool_call.function.arguments
+                )
+            except json.JSONDecodeError as e:
+                result =  f"Error: 工具参数 JSON 解析失败: {e}，请修正后重试"
+            else:
+                try:
+                    # 1. 展示工具调用
+                    print_tool_call(function_name, arguments)
+                    result = execute_tool(function_name,arguments)
+                    # 3. 展示执行结果
+                    print_tool_result(function_name, result)
+                except Exception as e:
+                    result = f"Error: 工具执行失败：{e}"
+
+            tool_messages.append(
+                {
+                    "role":"tool",
+                    "tool_call_id":tool_call.id,
+                    "content":result
+                }
+            )
+        return tool_messages
+
 
     def _chat_openai(self,user_message):
         history_len = len(self.openai_messages)
@@ -430,31 +546,67 @@ class Agent:
                 self.turn_cost_usd = 0.0
                 return
             
-            for tool_call in message.tool_calls:
-                function_name = tool_call.function.name
-                try:
-                    arguments = json.loads(
-                        tool_call.function.arguments
-                    )
-                except json.JSONDecodeError as e:
-                    result =  f"Error: 工具参数 JSON 解析失败: {e}，请修正后重试"
-                else:
-                    try:
-                        # 1. 展示工具调用
-                        print_tool_call(function_name, arguments)
-                        result = execute_tool(function_name,arguments)
-                        # 3. 展示执行结果
-                        print_tool_result(function_name, result)
-                    except Exception as e:
-                        result = f"Error: 工具执行失败：{e}"
-                
-                self.openai_messages.append(
-                    {
-                        "role":"tool",
-                        "tool_call_id":tool_call.id,
-                        "content":result
-                    }
+            self.openai_messages.extend(
+                self._run_openai_tools(message)
+            )
+
+
+    def _chat_openai_stream(self,user_message):
+        history_len = len(self.openai_messages)
+        self.turn_count = 0
+        # reminder拼接到第一条用户消息前面
+        if history_len == 1:
+            reminder = build_user_context_reminder()
+            user_message = f"{reminder}\n\n{user_message}"
+
+        self.openai_messages.append({"role": "user", "content": user_message})
+        while True:
+            self.turn_count += 1
+            self.total_api_calls += 1
+            if self.max_turns is not None and self.turn_count > self.max_turns:
+                print(f"已达到最大轮数（{self.max_turns}），强制停止。")
+                return
+
+            try:
+                response = self.call_openai_stream(
+                    messages = self.openai_messages,
+                    tools= self.tools,
+                    on_text=print_text_delta
                 )
+            except KeyboardInterrupt:
+                console.print()
+                print("已中断本轮对话")
+                del self.openai_messages[history_len:]
+                return
+            except Exception as e:
+                console.print()
+                print(f"调用失败：{e}")
+                del self.openai_messages[history_len:]
+                return
+
+            #统计token消耗（最终 completion 里的 usage 已是完整值，只记一次）
+            if response.usage is not None:
+                self._record_usage(response.usage)
+
+            message = response.choices[0].message
+
+            self.openai_messages.append(
+                message.model_dump(exclude_none=True)
+            )
+            #流式文本可能没有以换行结尾，后面接工具输出/usage 前补一个换行
+            if message.content:
+                console.print()
+
+            if not message.tool_calls:
+                self.show_usage()
+                # 开始下一轮之前，清空本轮统计
+                self.turn_usage = TokenUsage()
+                self.turn_cost_usd = 0.0
+                return
+
+            self.openai_messages.extend(
+                self._run_openai_tools(message)
+            )
 
 
     # ---------------- OpenAI 调用层 ----------------
@@ -469,9 +621,27 @@ class Agent:
                 )
         return response
 
-    def call_openai_stream(self, messages: list[dict], tools: list[dict] | None = None):
-        """流式调用 OpenAI 兼容接口，返回 SDK 流迭代器。"""
-        raise NotImplementedError
+    def call_openai_stream(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        on_text: Callable[[str], None] | None = None,
+    ):
+        """流式调用 OpenAI 兼容接口：文本增量交给 on_text，返回最终 completion。
+
+        include_usage 必须显式开启，否则流式响应不带 usage；
+        工具调用的参数增量由 SDK 合并，最终 completion 里已是完整 JSON。
+        """
+        with self.openai_client.chat.completions.stream(
+            model = self.model,
+            messages=messages,
+            tools=tools,
+            stream_options={"include_usage": True},
+        ) as stream:
+            for event in stream:
+                if event.type == "content.delta" and on_text is not None:
+                    on_text(event.delta)
+            return stream.get_final_completion()
 
     # ---------------- Anthropic 调用层 ----------------
 
@@ -500,9 +670,30 @@ class Agent:
         messages: list[dict],
         tools: list[dict] | None = None,
         system: str | None = None,
+        on_text: Callable[[str], None] | None = None,
     ):
-        """流式调用 Anthropic，返回 SDK 事件流迭代器。"""
-        raise NotImplementedError
+        """流式调用 Anthropic：文本增量交给 on_text，返回最终完整 Message。
+
+        工具参数片段、usage 等不在这里处理——最终消息里都是完整值，
+        Agent 循环拿到的对象和非流式调用同构。
+        """
+        with self.anthropic_client.messages.stream(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            system=system or self.system_prompt,
+            messages=messages,
+            tools=tools,
+        ) as stream:
+            for event in stream:
+                if (
+                    event.type == "content_block_delta"
+                    and event.delta.type == "text_delta"
+                ):
+                    if on_text is not None:
+                        on_text(event.delta.text)
+            return stream.get_final_message()
+
+
 
 
     def run(self):

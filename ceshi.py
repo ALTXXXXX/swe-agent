@@ -1,21 +1,17 @@
-import os
-from dotenv import load_dotenv
-from anthropic import Anthropic
+import asyncio
+from anthropic import AsyncAnthropic
 
-load_dotenv(override=True)
-print("OPENAI_API_KEY:", bool(os.environ.get("OPENAI_API_KEY")))
-print("ANTHROPIC_API_KEY:", bool(os.environ.get("ANTHROPIC_API_KEY")))
-client = Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url=os.getenv("ANTHROPIC_BASE_URL")
-)
 
-response = client.messages.create(
-    model="deepseek-flash",
-    max_tokens=1000,
-    messages=[
-        {"role": "user", "content": "你好"}
-    ]
-)
+async def main():
+    async with client.messages.stream(
+        model="deepseek-flash",
+        max_tokens=1024,
+        messages=[
+            {"role":"user","content":"介绍一下python"}
+        ]
+    )as stream:
+        final_message = await stream.get_final_message()
+        print("完整响应：")
+        print(final_message)
 
-print(response.content)
+asyncio.run(main())

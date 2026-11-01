@@ -109,6 +109,14 @@ def _summarize_result(name: str, result: str) -> str:
         return result or "执行完成"
 
 
+def print_text_delta(text: str) -> None:
+    """流式输出文本增量。禁用 markup/highlight，避免模型输出被 rich 解析。"""
+    if not text:
+        return
+    console.print(text, end="", markup=False, highlight=False)
+    console.file.flush()
+
+
 def print_tool_result(name: str, result: str) -> None:
     """展示工具执行结果摘要。"""
 
