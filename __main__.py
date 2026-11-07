@@ -4,9 +4,7 @@ import sys
 from agent import Agent
 from session import load_session, save_session,list_sessions,get_latest_session_id
 from dotenv import load_dotenv
-load_dotenv()    
-print("OPENAI_API_KEY:", bool(os.environ.get("OPENAI_API_KEY")))
-print("ANTHROPIC_API_KEY:", bool(os.environ.get("ANTHROPIC_API_KEY")))
+load_dotenv()
 def parse_args()-> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="mini-agent", add_help=False)
     parser.add_argument("prompt", nargs="*")
@@ -24,12 +22,14 @@ def parse_args()-> argparse.Namespace:
     return parser.parse_args()
 
 
+
 def _resolve_permission_mode(args: argparse.Namespace) -> str:
     if args.yolo: return "bypassPermissions"
     if args.plan: return "plan"
     if args.accept_edits: return "acceptEdits"
     if args.dont_ask: return "dontAsk"
     return "default"
+
 
 
 def main() -> None:
@@ -54,7 +54,7 @@ def main() -> None:
         sys.exit(1)  
   
     api_base = args.api_base or env_base_url
-    print(f"{provider}\n\{resolved_api_key}\n{env_base_url}\n")
+    print(f"provider={provider} base_url={api_base}")
     agent = Agent(
         provider = provider,
         permission_mode=permission_mode,
@@ -84,9 +84,9 @@ def main() -> None:
         agent.chat_once(prompt)
     else:
         agent.run()
-        
 
-    
+
+
     #否则run_REPL
 if __name__ == "__main__":
     main()

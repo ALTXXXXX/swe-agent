@@ -1,6 +1,7 @@
 
 
 from pathlib import Path
+from permissions import chek_permission
 import sys
 from anthropic.resources import messages
 from openai import OpenAI, chat
@@ -312,6 +313,30 @@ class Agent:
         return anthropic_tools
 
 
+    def _check_permission(self, tool_name: str, arguments: dict) -> tuple[bool, str]:
+        """按当前权限模式决定是否执行工具，返回 (是否允许, 拒绝原因)。
+
+        confirm 状态下在终端询问用户；拒绝原因会作为工具结果回传给模型，
+        这样模型能知道调用被拦下，而不是以为工具执行成功了。
+        """
+        if not isinstance(arguments, dict):
+            return False, f"工具参数错误：期望对象，收到 {type(arguments).__name__}"
+
+        decision = chek_permission(tool_name, arguments, self.permission_mode)
+        action = decision.get("action", "deny")
+        message = decision.get("message") or tool_name
+
+        if action == "allow":
+            return True, ""
+        if action == "deny":
+            return False, f"权限拒绝：{message}"
+
+        # action == "confirm"：当前是同步 REPL，直接用 input() 询问
+        answer = input(f"\n需要确认：{message}\n允许执行？[y/N] ")
+        if answer.strip().lower() in ("y", "yes"):
+            return True, ""
+        return False, f"用户拒绝执行：{message}"
+
     def _run_anthropic_tools(self, response) -> list[dict]:
         """执行响应中的 tool_use 块，返回可直接回传的 tool_result 列表。"""
         tool_result = []
@@ -323,11 +348,16 @@ class Agent:
             arguments = block.input
             call_id = block.id
             try:
-                # 1. 展示工具调用
-                print_tool_call(function_name, arguments)
-                result = execute_tool(function_name, arguments)
-                # 3. 展示执行结果
-                print_tool_result(function_name, result)
+                allowed, reason = self._check_permission(function_name, arguments)
+                if allowed:
+                    # 1. 展示工具调用
+                    print_tool_call(function_name, arguments)
+                    result = execute_tool(function_name, arguments)
+                    # 3. 展示执行结果
+                    print_tool_result(function_name, result)
+                else:
+                    result = f"Error: {reason}"
+                    print_tool_result(function_name, result)
             except Exception as e:
                 result = f"Error: 工具执行失败：{e}"
 
@@ -484,11 +514,16 @@ class Agent:
                 result =  f"Error: 工具参数 JSON 解析失败: {e}，请修正后重试"
             else:
                 try:
-                    # 1. 展示工具调用
-                    print_tool_call(function_name, arguments)
-                    result = execute_tool(function_name,arguments)
-                    # 3. 展示执行结果
-                    print_tool_result(function_name, result)
+                    allowed, reason = self._check_permission(function_name, arguments)
+                    if allowed:
+                        # 1. 展示工具调用
+                        print_tool_call(function_name, arguments)
+                        result = execute_tool(function_name, arguments)
+                        # 3. 展示执行结果
+                        print_tool_result(function_name, result)
+                    else:
+                        result = f"Error: {reason}"
+                        print_tool_result(function_name, result)
                 except Exception as e:
                     result = f"Error: 工具执行失败：{e}"
 
@@ -709,10 +744,14 @@ class Agent:
 
 
 if __name__ == "__main__":
+    # 密钥只从环境变量读取，禁止再写死到代码里
+    api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise SystemExit("未找到 ANTHROPIC_API_KEY / OPENAI_API_KEY，请在 .env 中配置")
     agent = Agent(
         provider="anthropic",
         api_base="https://api.deepseek.com/anthropic",
-        api_key="***REMOVED***"
+        api_key=api_key
     )
     response = agent.call_anthropic(
          messages=[

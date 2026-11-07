@@ -1,3 +1,4 @@
+import inspect
 import json
 from pathlib import Path
 import subprocess
@@ -178,17 +179,43 @@ tool_definitions = [
  
 
 ]
+
+TOOLS=[]
+
+def tool(name,description,parameters):
+    """装饰器：把一个函数注册为工具"""
+    def decorator(func):
+        TOOLS[name] = {
+            "schema":{"type":"function","function":{
+                "name":name, "description":description,"parameters":parameters
+            },
+            "func":func
+            }
+        }
+        return func
+    return decorator
+
+def get_schemas():
+    """返回给模型看的全部工具说明书"""
+    return [t["schema"] for t in TOOLS.values()]
+
+
+
+def _params(**props):
+    return {"type": "object",
+            "properties": {k: {"type": "string", "description": v} for k, v in props.items()},
+            "required": list(props)}
+
+
 #执行天气查询的工具
-def get_weather(inp: dict) -> str:
-    location = inp["location"]
+def get_weather(location: str) -> str:
     return f"当前{location}的天气是晴朗，25摄氏度"
 
 
 
-def _read_file(inp: dict) -> str:
-    
+def read_file(file_path: str) -> str:
     try:
-        content = Path(inp["file_path"]).read_text()
+        content = Path(file_path).read_text()
         lines = content.splitlines()
         numbered = "\n".join(
         f"{i+1:4d} | {line}" for i, line in enumerate(lines)
@@ -198,9 +225,8 @@ def _read_file(inp: dict) -> str:
         return f"错误的文件读取：{e}"
 
 
-def _web_fetch(inp: dict) -> str:
-    url = inp["url"]
-    max_length = inp.get("max_length",50000)
+def web_fetch(url: str, max_length: int | None = None) -> str:
+    max_length = max_length or 50000
     if not url.startswith(("http://", "https://")):
         return f"Error: only http/https is supported, got: {url}"
     
@@ -240,47 +266,48 @@ def _web_fetch(inp: dict) -> str:
     #返回结果
     return text or "(empty response)"
 
-def _edit_file(inp: dict) -> str:
+def edit_file(file_path: str, old_string: str, new_string: str) -> str:
     try:
-            #根据文件读取内容content
-        with open(inp["file_path"], encoding="utf-8") as f:
+        #根据文件读取内容content
+        with open(file_path, encoding="utf-8") as f:
             content = f.read()
         #寻找old_string是否存在
-        if inp["old_string"] not in content:
+        if old_string not in content:
             #如果不存在返回错误，不匹配
-            return f"Error: old_string not found in {inp['file_path']}"
-        
-        #如果存在，判断count是否大一1，如果大于1则返回错误
-        count = content.count(inp["old_string"])
+            return f"Error: old_string not found in {file_path}"
+
+        #如果存在，判断count是否大于1，如果大于1则返回错误
+        count = content.count(old_string)
         if count > 1:
-            return f"Error: old_string found {count} times in {inp['file_path']}. Must be unique."
+            return f"Error: old_string found {count} times in {file_path}. Must be unique."
         #存在且count等于1，则正确。把new_string替换到old_string
-        new_content = content.replace(inp["old_string"],inp["new_string"])
-        #把新的新的字符串写回到文件中
-        with open(inp["file_path"], "w", encoding="utf-8") as f:
+        new_content = content.replace(old_string, new_string)
+        #把新的字符串写回到文件中
+        with open(file_path, "w", encoding="utf-8") as f:
             f.write(new_content)
         #返回
-        return  f"Successfully edited {inp['file_path']}"
+        return f"Successfully edited {file_path}"
     except Exception as e:
-         return f"Error editing file: {e}"
+        return f"Error editing file: {e}"
 
-def _write_file(inp: dict) -> str:
+def write_file(file_path: str, content: str) -> str:
     try:
-        path = Path(inp["file_path"])
-        path.parent.mkdir(parents=True,exist_ok=True)
-        path.write_text(inp["content"])
-        lines = inp["content"]
+        path = Path(file_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        # splitlines 才是按行切分；直接 len(content) 得到的是字符数
+        lines = content.splitlines()
         line_count = len(lines)
         preview = "\n".join(
-        f"{i+1:4d} | {l}" for i,l in enumerate(lines[:30])
+            f"{i+1:4d} | {line}" for i, line in enumerate(lines[:30])
         )
         trunc = f"\n  ... ({line_count} lines total)" if line_count > 30 else ""
-        return f"Successfully wrote to {inp['file_path']} ({line_count} lines)\n\n{preview}{trunc}"
+        return f"Successfully wrote to {file_path} ({line_count} lines)\n\n{preview}{trunc}"
     except Exception as e:
         return f"Error writing file: {e}"
 
-def _list_files(inp: dict) -> str:
-    d =Path(inp["file_path"])
+def list_files(file_path: str) -> str:
+    d = Path(file_path)
     if not d.exists():
         return f"Error: directory not found: {d}"
     entries = sorted(d.iterdir(),key= lambda p: (p.is_file(),p.name))
@@ -290,12 +317,10 @@ def _list_files(inp: dict) -> str:
     )
 
 
-def _grep_search(inp: dict) -> str:
+def grep_search(pattern: str, path: str | None = None, include: str | None = None) -> str:
     try:
-        # inp：{pattern, path(可选), include(可选：只搜某种文件，如 "*.py)}
-        pattern = inp["pattern"]
-        path = inp.get("path") or "."
-        include = inp.get("include")
+        # path 默认当前目录；include 可选，如 "*.py" 只搜 Python 文件
+        path = path or "."
         # 拼命令
         args = ["grep","--line-number","--color=never","-r"]
         if include:
@@ -328,11 +353,11 @@ def _decode_output(data: bytes) -> str:
 
 
 
-def _run_shell(inp:dict) -> str:
+def run_shell(command: str, timeout: int | None = None) -> str:
+    timeout = timeout or 30
     try:
-        timeout = inp.get("timeout", 30)
         result = subprocess.run(
-            inp["command"],
+            command,
             shell=True,
             capture_output=True,
             timeout=timeout
@@ -345,38 +370,44 @@ def _run_shell(inp:dict) -> str:
             return f"Command failed (exit code {result.returncode}){stdout}{stderr}"
         return stdout or "(no output)"    
     except subprocess.TimeoutExpired:
-        return f"Command timed out after {inp.get('timeout', 30)}s"
+        return f"Command timed out after {timeout}s"
     except Exception as e:
         return f"Error: {e}"
 
 
 
 tool_handlers = {
-    "read_file": _read_file,
-    "edit_file": _edit_file,
-    "write_file": _write_file,
-    "list_files": _list_files,
-    "grep_search": _grep_search,
-    "run_shell": _run_shell,
+    "read_file": read_file,
+    "edit_file": edit_file,
+    "write_file": write_file,
+    "list_files": list_files,
+    "grep_search": grep_search,
+    "run_shell": run_shell,
     "get_weather": get_weather,
-    "web_fetch": _web_fetch
+    "web_fetch": web_fetch
 
 }
 
 
 
-def execute_tool(name: str, inp: dict) -> str:
+def execute_tool(name: str, inp: object) -> str:
+    function = tool_handlers.get(name)
+    if function is None:
+        return f"错误：不存在工具：{name}"
+
+    if not isinstance(inp, dict):
+        return f"工具参数错误：期望对象，收到 {type(inp).__name__}"
+
+    # 先只做参数绑定校验，避免把工具内部抛出的 TypeError 误报成参数错误
+    try:
+        inspect.signature(function).bind(**inp)
+    except TypeError as e:
+        return f"工具参数错误：{e}"
 
     try:
-        
-        function =  tool_handlers.get(name)
-        if function is None:
-            return f"错误：不存在工具：{name}"
-        result = function(inp)
-        return str(result)
-
+        return str(function(**inp))
     except Exception as e:
-        return f"工具执行失败： {e}"
+        return f"工具执行失败：{e}"
 
 
 
