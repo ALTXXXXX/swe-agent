@@ -4,11 +4,12 @@ from pathlib import Path
 from permissions import chek_permission
 import sys
 from anthropic.resources import messages
+from anthropic import AsyncAnthropic
 from openai import OpenAI, chat
 from dotenv import load_dotenv
 from openai.types.responses import tool
 from session import save_session
-from tools import tool_definitions,execute_tool
+from tools import tool_definitions,execute_tool,CONCURRENCY_SAFE_TOOLS
 import uuid
 import time
 from typing import Callable, Awaitable
@@ -16,13 +17,13 @@ import os
 import json
 from prompt import build_static_system_prompt,build_dynamic_system_prompt,build_user_context_reminder
 from pricing import resolve, cost_of
-import tools
 from usage import TokenUsage, from_openai,from_anthropic
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from rich.console import Console
 from anthropic import Anthropic
 from rich.text import Text
+import asyncio
 from ui import print_tool_call, print_tool_result, print_text_delta
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 load_dotenv()
@@ -82,7 +83,7 @@ class Agent:
             )
             self.anthropic_client = None
         elif self.provider == "anthropic":
-            self.anthropic_client = Anthropic(
+            self.anthropic_client = AsyncAnthropic(
                 api_key=api_key,
                 base_url = api_base
             )
@@ -287,17 +288,17 @@ class Agent:
 
     #处理一轮用户对话
 
-    def chat_once(self,user_message):
+    async def chat_once(self,user_message):
         if self.provider == "openai":
             if self.stream:
-                self._chat_openai_stream(user_message)
+                await self._chat_openai_stream(user_message)
             else:
-                self._chat_openai(user_message)
+                await self._chat_openai(user_message)
         elif self.provider == "anthropic":
             if self.stream:
-                self._chat_anthropic_stream(user_message)
+                await self._chat_anthropic_stream(user_message)
             else:
-                self._chat_anthropic(user_message)
+                await self._chat_anthropic(user_message)
 
     def convert_to_anthropic_tools(self):
         """讲openai格式的工具定义转换为Anthropic的格式"""
@@ -335,10 +336,22 @@ class Agent:
         answer = input(f"\n需要确认：{message}\n允许执行？[y/N] ")
         if answer.strip().lower() in ("y", "yes"):
             return True, ""
-        return False, f"用户拒绝执行：{message}"
+        return False, f"用户拒绝执 行：{message}"
 
-    def _run_anthropic_tools(self, response) -> list[dict]:
-        """执行响应中的 tool_use 块，返回可直接回传的 tool_result 列表。"""
+    async def _run_anthropic_tools(
+        self,
+        response,
+        early_tasks: dict[str, asyncio.Task] | None = None,
+        early_results: dict[str, str] | None = None,
+    ) -> list[dict]:
+        """执行响应中的 tool_use 块，返回可直接回传的 tool_result 列表。
+
+        early_tasks / early_results 是流式生成期间已经提前启动、或已经判定结果的
+        工具，按 tool_use id 取回，避免流结束后重复执行。
+        """
+        early_tasks = early_tasks if early_tasks is not None else {}
+        early_results = early_results if early_results is not None else {}
+
         tool_result = []
         for block in response.content:
             if block.type != "tool_use":
@@ -347,20 +360,30 @@ class Agent:
             function_name = block.name
             arguments = block.input
             call_id = block.id
-            try:
-                allowed, reason = self._check_permission(function_name, arguments)
-                if allowed:
-                    # 1. 展示工具调用
-                    print_tool_call(function_name, arguments)
-                    result = execute_tool(function_name, arguments)
-                    # 3. 展示执行结果
-                    print_tool_result(function_name, result)
-                else:
-                    result = f"Error: {reason}"
-                    print_tool_result(function_name, result)
-            except Exception as e:
-                result = f"Error: 工具执行失败：{e}"
 
+            if call_id in early_results:
+                #流式阶段已判定（比如被权限拒绝），直接用那个结果
+                result = early_results[call_id]
+            elif call_id in early_tasks:
+                #流式阶段已启动，等它跑完
+                task = early_tasks.pop(call_id)
+                try:
+                    result = await task
+                except Exception as e:
+                    result = f"Error: 工具执行失败：{e}"
+            else:
+                #非并发安全工具（写文件/命令），或参数 JSON 解析失败：流结束后执行
+                try:
+                    allowed, reason = self._check_permission(function_name, arguments)
+                    if allowed:
+                        print_tool_call(function_name, arguments)
+                        result = await execute_tool(function_name, arguments)
+                    else:
+                        result = f"Error: {reason}"
+                except Exception as e:
+                    result = f"Error: 工具执行失败：{e}"
+
+            print_tool_result(function_name, result)
             tool_result.append(
                 {
                     "type": "tool_result",
@@ -371,7 +394,7 @@ class Agent:
         return tool_result
 
 
-    def _chat_anthropic(self,user_message):
+    async def _chat_anthropic(self,user_message):
         history_len = len(self.anthropic_messages)
         if history_len == 0:
             #reminder拼接到第一条用户消息前面
@@ -414,7 +437,7 @@ class Agent:
                 return
             #涉及到工具调用，执行工具并拼装 tool_result
             if response.stop_reason == "tool_use":
-                tool_result = self._run_anthropic_tools(response)
+                tool_result = await self._run_anthropic_tools(response)
                 if tool_result:
                     self.anthropic_messages.append({
                         "role":"user",
@@ -422,12 +445,12 @@ class Agent:
                     })
                     continue
                 print("模型请求工具调用，但没有找到 tool_use 内容块")
-                return                
+                return
             print(f"模型停止生成，原因：{response.stop_reason}")
             return
 
 
-    def _chat_anthropic_stream(self,user_message):
+    async def _chat_anthropic_stream(self,user_message):
         history_len = len(self.anthropic_messages)
         if history_len == 0:
             #reminder拼接到第一条用户消息前面
@@ -447,61 +470,94 @@ class Agent:
                 return
             self.turn_count += 1
 
-            try:
-                response = self.call_anthropic_stream(
-                    messages = self.anthropic_messages,
-                    tools=self.anthropic_tools,
-                    on_text=print_text_delta
+            #流式生成过程中提前启动的并发安全工具（按 tool_use id）
+            early_tasks: dict[str, asyncio.Task] = {}
+            #流式阶段已判定为不能执行的结果（按 tool_use id）
+            early_results: dict[str, str] = {}
+
+            async def on_tool_block_complete(block):
+                if block["name"] not in CONCURRENCY_SAFE_TOOLS:
+                    return
+                #并发安全工具全是读操作，权限判断是纯规则匹配，
+                #不会走到 input()，同步调用不会阻塞事件循环
+                allowed, reason = self._check_permission(block["name"],block["input"])
+                if not allowed:
+                    early_results[block["id"]] = f"Error: {reason}"
+                    return
+                print_tool_call(block["name"], block["input"])
+                early_tasks[block["id"]] = asyncio.create_task(
+                    execute_tool(block["name"],block["input"])
                 )
-            except KeyboardInterrupt:
-                console.print()
-                print("已中断本轮对话")
-                del self.anthropic_messages[history_len:]
+
+            try:
+                try:
+                    response = await self.call_anthropic_stream(
+                        messages = self.anthropic_messages,
+                        tools=self.anthropic_tools,
+                        on_text=print_text_delta,
+                        on_tool_block_complete= on_tool_block_complete
+                    )
+                except KeyboardInterrupt:
+                    console.print()
+                    print("已中断本轮对话")
+                    del self.anthropic_messages[history_len:]
+                    return
+                except Exception as e:
+                    console.print()
+                    print(f"调用失败：{e}")
+                    del self.anthropic_messages[history_len:]
+                    return
+                self.total_api_calls += 1
+
+                #统计token消耗（最终消息里的 usage 已是完整值，只记一次）
+                if response.usage is not None:
+                    self._record_usage(response.usage)
+
+                self.anthropic_messages.append(
+                    response.model_dump(include={"role","content"})
+                )
+                #流式文本可能没有以换行结尾，后面接工具输出/usage 前补一个换行
+                has_text = any(
+                    block.type == "text" and block.text
+                    for block in response.content
+                )
+                if has_text:
+                    console.print()
+
+                if response.stop_reason == "end_turn":
+                    self.show_usage()
+                    self.turn_usage = TokenUsage()
+                    self.turn_cost_usd = 0.0
+                    return
+
+                if response.stop_reason == "tool_use":
+                    #提前启动的工具按 id 取结果；写文件/命令类工具在这里才执行，
+                    #已经提前跑过的工具不会再跑一遍
+                    tool_result = await self._run_anthropic_tools(
+                        response, early_tasks, early_results
+                    )
+                    if tool_result:
+                        self.anthropic_messages.append({
+                            "role":"user",
+                            "content":tool_result
+                        })
+                        continue
+                    print("模型请求工具调用，但没有找到 tool_use 内容块")
+                    return
+
+                print(f"模型停止生成，原因：{response.stop_reason}")
                 return
-            except Exception as e:
-                console.print()
-                print(f"调用失败：{e}")
-                del self.anthropic_messages[history_len:]
-                return
-            self.total_api_calls += 1
-
-            #统计token消耗（最终消息里的 usage 已是完整值，只记一次）
-            if response.usage is not None:
-                self._record_usage(response.usage)
-
-            self.anthropic_messages.append(
-                response.model_dump(include={"role","content"})
-            )
-            #流式文本可能没有以换行结尾，后面接工具输出/usage 前补一个换行
-            has_text = any(
-                block.type == "text" and block.text
-                for block in response.content
-            )
-            if has_text:
-                console.print()
-
-            if response.stop_reason == "end_turn":
-                self.show_usage()
-                self.turn_usage = TokenUsage()
-                self.turn_cost_usd = 0.0
-                return
-
-            if response.stop_reason == "tool_use":
-                tool_result = self._run_anthropic_tools(response)
-                if tool_result:
-                    self.anthropic_messages.append({
-                        "role":"user",
-                        "content":tool_result
-                    })
-                    continue
-                print("模型请求工具调用，但没有找到 tool_use 内容块")
-                return
-
-            print(f"模型停止生成，原因：{response.stop_reason}")
-            return
+            finally:
+                #异常/中断/非 tool_use 结束时，取消还没取回结果的提前任务
+                for task in early_tasks.values():
+                    task.cancel()
+                if early_tasks:
+                    await asyncio.gather(
+                        *early_tasks.values(), return_exceptions=True
+                    )
 
 
-    def _run_openai_tools(self, message) -> list[dict]:
+    async def _run_openai_tools(self, message) -> list[dict]:
         """解析并执行 message.tool_calls，返回 tool 角色消息列表。"""
         tool_messages = []
         for tool_call in message.tool_calls:
@@ -518,7 +574,7 @@ class Agent:
                     if allowed:
                         # 1. 展示工具调用
                         print_tool_call(function_name, arguments)
-                        result = execute_tool(function_name, arguments)
+                        result = await execute_tool(function_name, arguments)
                         # 3. 展示执行结果
                         print_tool_result(function_name, result)
                     else:
@@ -537,7 +593,7 @@ class Agent:
         return tool_messages
 
 
-    def _chat_openai(self,user_message):
+    async def _chat_openai(self,user_message):
         history_len = len(self.openai_messages)
         self.turn_count = 0
         # reminder拼接到第一条用户消息前面
@@ -582,11 +638,11 @@ class Agent:
                 return
             
             self.openai_messages.extend(
-                self._run_openai_tools(message)
+                await self._run_openai_tools(message)
             )
 
 
-    def _chat_openai_stream(self,user_message):
+    async def _chat_openai_stream(self,user_message):
         history_len = len(self.openai_messages)
         self.turn_count = 0
         # reminder拼接到第一条用户消息前面
@@ -640,7 +696,7 @@ class Agent:
                 return
 
             self.openai_messages.extend(
-                self._run_openai_tools(message)
+                await self._run_openai_tools(message)
             )
 
 
@@ -700,45 +756,73 @@ class Agent:
 
 
 
-    def call_anthropic_stream(
+    async def call_anthropic_stream(
         self,
         messages: list[dict],
         tools: list[dict] | None = None,
         system: str | None = None,
         on_text: Callable[[str], None] | None = None,
+        on_tool_block_complete: Callable[[dict], Awaitable[None]] | None = None,
     ):
         """流式调用 Anthropic：文本增量交给 on_text，返回最终完整 Message。
 
         工具参数片段、usage 等不在这里处理——最终消息里都是完整值，
         Agent 循环拿到的对象和非流式调用同构。
+        某个 tool_use 块的参数收齐后，交给 on_tool_block_complete 提前执行。
         """
-        with self.anthropic_client.messages.stream(
+        tool_blocks_by_index: dict[int, dict] = {}
+        async with self.anthropic_client.messages.stream(
             model=self.model,
             max_tokens=self.max_tokens,
             system=system or self.system_prompt,
             messages=messages,
             tools=tools,
         ) as stream:
-            for event in stream:
-                if (
-                    event.type == "content_block_delta"
-                    and event.delta.type == "text_delta"
-                ):
-                    if on_text is not None:
-                        on_text(event.delta.text)
-            return stream.get_final_message()
+            async for event in stream:
+                if event.type == "content_block_start":
+                    cb = event.content_block
+                    if cb.type == "tool_use":
+                        tool_blocks_by_index[event.index] = {
+                            "id":cb.id, "name":cb.name, "input_json":""
+                        }
+                elif event.type == "content_block_delta":
+                    if event.delta.type == "text_delta":
+                        if on_text is not None:
+                            on_text(event.delta.text)
+                    elif event.delta.type == "input_json_delta":
+                        tracked = tool_blocks_by_index.get(event.index)
+                        if tracked:
+                            tracked["input_json"] += event.delta.partial_json
+                elif event.type == "content_block_stop" and on_tool_block_complete:
+                    tracked = tool_blocks_by_index.pop(event.index, None)
+                    if tracked:
+                        try:
+                            #没有参数的工具有时不给 partial_json，按 {} 处理
+                            inp = json.loads(tracked["input_json"] or "{}")
+                        except json.JSONDecodeError:
+                            #参数没收完整：不提前执行，交给最终消息兜底
+                            continue
+                        await on_tool_block_complete({
+                            "type":"tool_use",
+                            "id":tracked["id"],
+                            "name":tracked["name"],
+                            "input":inp
+                        })
+            final_message = await stream.get_final_message()
+
+        return final_message
 
 
 
 
-    def run(self):
+    async def run(self):
         while True:
             user_message = input("User: ")
 
             if user_message.strip().lower() in ("exit",""):
                 print("Bye!")
                 break
-            self.chat_once(user_message)
+            await self.chat_once(user_message)
             self.auto_save()
                                     
 

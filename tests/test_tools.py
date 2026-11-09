@@ -1,4 +1,5 @@
 # tests/test_tools.py
+import asyncio
 from pathlib import Path
 
 from tools import (
@@ -9,6 +10,11 @@ from tools import (
     run_shell,
     write_file,
 )
+
+
+def _run(coro):
+    """execute_tool 已改为 async，同步测试里用 asyncio.run 驱动。"""
+    return asyncio.run(coro)
 
 
 def test_list_files_dir_not_found():
@@ -69,20 +75,20 @@ def test_run_shell_timeout():
 
 
 def test_execute_tool_unknown_tool():
-    result = execute_tool("not_a_tool", {})
+    result = _run(execute_tool("not_a_tool", {}))
     assert "不存在" in result
 
 
 def test_execute_tool_missing_argument():
-    result = execute_tool("read_file", {})
+    result = _run(execute_tool("read_file", {}))
     assert "参数错误" in result
 
 
 def test_execute_tool_extra_argument():
-    result = execute_tool("read_file", {"file_path": "x", "unexpected": 1})
+    result = _run(execute_tool("read_file", {"file_path": "x", "unexpected": 1}))
     assert "参数错误" in result
 
 
 def test_execute_tool_non_dict_arguments():
-    result = execute_tool("read_file", ["not", "a", "dict"])
+    result = _run(execute_tool("read_file", ["not", "a", "dict"]))
     assert "参数错误" in result

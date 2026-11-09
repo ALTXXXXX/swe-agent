@@ -4,6 +4,7 @@ import sys
 from agent import Agent
 from session import load_session, save_session,list_sessions,get_latest_session_id
 from dotenv import load_dotenv
+import asyncio
 load_dotenv()
 def parse_args()-> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="mini-agent", add_help=False)
@@ -81,9 +82,9 @@ def main() -> None:
     # 如果有prompt，则单次对话
     prompt = " ".join(args.prompt) if args.prompt else ""
     if prompt:
-        agent.chat_once(prompt)
+        asyncio.run(agent.chat_once(prompt))
     else:
-        agent.run()
+        asyncio.run(agent.run()) 
 
 
 

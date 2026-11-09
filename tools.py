@@ -5,6 +5,7 @@ import subprocess
 import re
 import html
 import urllib.request
+import asyncio
 import urllib.error
 
 from sys import stdout
@@ -179,6 +180,10 @@ tool_definitions = [
  
 
 ]
+
+# tools.py
+CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch"}
+
 
 TOOLS=[]
 
@@ -390,7 +395,7 @@ tool_handlers = {
 
 
 
-def execute_tool(name: str, inp: object) -> str:
+async def execute_tool(name: str, inp: object) -> str:
     function = tool_handlers.get(name)
     if function is None:
         return f"错误：不存在工具：{name}"
@@ -405,7 +410,8 @@ def execute_tool(name: str, inp: object) -> str:
         return f"工具参数错误：{e}"
 
     try:
-        return str(function(**inp))
+        result = await asyncio.to_thread(function,**inp)
+        return str(result)
     except Exception as e:
         return f"工具执行失败：{e}"
 
