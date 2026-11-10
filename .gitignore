@@ -12,4 +12,4 @@ output/
 tools/
 CLAUDE.md
 PROJECT_BRIEF.md
-tests/test_tools.py
+tests/

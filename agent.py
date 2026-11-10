@@ -5,7 +5,7 @@ from permissions import chek_permission
 import sys
 from anthropic.resources import messages
 from anthropic import AsyncAnthropic
-from openai import OpenAI, chat
+from openai import OpenAI, chat, LengthFinishReasonError
 from dotenv import load_dotenv
 from openai.types.responses import tool
 from session import save_session
@@ -338,6 +338,98 @@ class Agent:
             return True, ""
         return False, f"用户拒绝执 行：{message}"
 
+    def _tool_interrupted_results(self, tool_uses, stop_reason) -> list[dict]:
+        """为没有正常完成的 tool_use 生成错误结果。
+
+        历史里只要出现 tool_use，下一条 user 消息就必须包含对应的
+        tool_result，否则后续所有请求都会被服务端以 400 拒绝。
+        """
+        results = []
+        for block in tool_uses:
+            content = (
+                f"Error: 工具调用未完成（stop_reason={stop_reason}），"
+                "参数可能不完整，未执行。请重新发起该工具调用。"
+            )
+            print_tool_result(block.name, content)
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": content,
+            })
+        return results
+
+    @staticmethod
+    def _as_content_blocks(content) -> list[dict]:
+        """把消息 content（字符串或块列表）统一成块列表。"""
+        if isinstance(content, list):
+            return content
+        if isinstance(content, str) and content:
+            return [{"type": "text", "text": content}]
+        return []
+
+    def _repair_anthropic_history(self) -> None:
+        """修复历史里没有对应 tool_result 的 tool_use。
+
+        旧版本在生成被截断、网关返回异常 stop_reason 或进程中断时，
+        可能把带 tool_use 的 assistant 消息留在了历史里。这里在每次
+        对话开始前补齐缺失的 tool_result，避免整段会话无法继续。
+        """
+        messages = self.anthropic_messages
+        index = 0
+
+        while index < len(messages):
+            message = messages[index]
+            content = message.get("content")
+
+            if message.get("role") != "assistant" or not isinstance(content, list):
+                index += 1
+                continue
+
+            tool_ids = [
+                block.get("id")
+                for block in content
+                if isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("id")
+            ]
+            if not tool_ids:
+                index += 1
+                continue
+
+            next_message = messages[index + 1] if index + 1 < len(messages) else None
+            next_is_user = bool(next_message) and next_message.get("role") == "user"
+
+            answered = set()
+            if next_is_user and isinstance(next_message.get("content"), list):
+                answered = {
+                    block.get("tool_use_id")
+                    for block in next_message["content"]
+                    if isinstance(block, dict) and block.get("type") == "tool_result"
+                }
+
+            missing = [tool_id for tool_id in tool_ids if tool_id not in answered]
+            if not missing:
+                index += 1
+                continue
+
+            results = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": "Error: 上一次工具调用未完成，未执行。请重新发起该工具调用。",
+                }
+                for tool_id in missing
+            ]
+
+            if next_is_user:
+                #tool_result 必须放在紧随其后的 user 消息内容最前面
+                next_message["content"] = results + self._as_content_blocks(
+                    next_message.get("content")
+                )
+            else:
+                messages.insert(index + 1, {"role": "user", "content": results})
+            index += 2
+
     async def _run_anthropic_tools(
         self,
         response,
@@ -395,6 +487,7 @@ class Agent:
 
 
     async def _chat_anthropic(self,user_message):
+        self._repair_anthropic_history()
         history_len = len(self.anthropic_messages)
         if history_len == 0:
             #reminder拼接到第一条用户消息前面
@@ -426,7 +519,25 @@ class Agent:
             self.anthropic_messages.append(
                 response.model_dump(include={"role","content"})
             )
-            #判断是否设计工具调用
+            #只要响应里有 tool_use，下一条消息就必须是对应的 tool_result
+            tool_uses = [
+                block for block in response.content
+                if block.type == "tool_use"
+            ]
+            if tool_uses:
+                if response.stop_reason == "tool_use":
+                    tool_result = await self._run_anthropic_tools(response)
+                else:
+                    #生成被截断（如 max_tokens）时参数可能不完整，不执行，
+                    #但仍要补 tool_result，否则历史非法，下一次请求会被拒绝
+                    tool_result = self._tool_interrupted_results(
+                        tool_uses, response.stop_reason
+                    )
+                self.anthropic_messages.append({
+                    "role":"user",
+                    "content":tool_result
+                })
+                continue
             if response.stop_reason == "end_turn":
                 for block in response.content:
                     if block.type == "text":
@@ -435,22 +546,12 @@ class Agent:
                 self.turn_usage = TokenUsage()
                 self.turn_cost_usd = 0.0
                 return
-            #涉及到工具调用，执行工具并拼装 tool_result
-            if response.stop_reason == "tool_use":
-                tool_result = await self._run_anthropic_tools(response)
-                if tool_result:
-                    self.anthropic_messages.append({
-                        "role":"user",
-                        "content":tool_result
-                    })
-                    continue
-                print("模型请求工具调用，但没有找到 tool_use 内容块")
-                return
             print(f"模型停止生成，原因：{response.stop_reason}")
             return
 
 
     async def _chat_anthropic_stream(self,user_message):
+        self._repair_anthropic_history()
         history_len = len(self.anthropic_messages)
         if history_len == 0:
             #reminder拼接到第一条用户消息前面
@@ -524,25 +625,34 @@ class Agent:
                 if has_text:
                     console.print()
 
+                #只要响应里有 tool_use，下一条消息就必须是对应的 tool_result
+                tool_uses = [
+                    block for block in response.content
+                    if block.type == "tool_use"
+                ]
+                if tool_uses:
+                    if response.stop_reason == "tool_use":
+                        #提前启动的工具按 id 取结果；写文件/命令类工具在这里才执行，
+                        #已经提前跑过的工具不会再跑一遍
+                        tool_result = await self._run_anthropic_tools(
+                            response, early_tasks, early_results
+                        )
+                    else:
+                        #生成被截断（如 max_tokens）时参数可能不完整，不执行，
+                        #只补错误结果，让模型下一轮重试
+                        tool_result = self._tool_interrupted_results(
+                            tool_uses, response.stop_reason
+                        )
+                    self.anthropic_messages.append({
+                        "role":"user",
+                        "content":tool_result
+                    })
+                    continue
+
                 if response.stop_reason == "end_turn":
                     self.show_usage()
                     self.turn_usage = TokenUsage()
                     self.turn_cost_usd = 0.0
-                    return
-
-                if response.stop_reason == "tool_use":
-                    #提前启动的工具按 id 取结果；写文件/命令类工具在这里才执行，
-                    #已经提前跑过的工具不会再跑一遍
-                    tool_result = await self._run_anthropic_tools(
-                        response, early_tasks, early_results
-                    )
-                    if tool_result:
-                        self.anthropic_messages.append({
-                            "role":"user",
-                            "content":tool_result
-                        })
-                        continue
-                    print("模型请求工具调用，但没有找到 tool_use 内容块")
                     return
 
                 print(f"模型停止生成，原因：{response.stop_reason}")
@@ -556,6 +666,24 @@ class Agent:
                         *early_tasks.values(), return_exceptions=True
                     )
 
+
+    def _interrupted_tool_messages(self, tool_calls, finish_reason: str) -> list[dict]:
+        """为因输出截断而未执行的 tool_call 生成错误结果。
+
+        OpenAI 的历史里，带 tool_calls 的 assistant 消息后面必须跟每个
+        tool_call_id 对应的 tool 消息，否则下一条请求会被服务端拒绝。
+        """
+        return [
+            {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": (
+                    f"Error: 工具调用未完成（finish_reason={finish_reason}），"
+                    "参数可能不完整，未执行。请重新发起该工具调用。"
+                ),
+            }
+            for tool_call in tool_calls
+        ]
 
     async def _run_openai_tools(self, message) -> list[dict]:
         """解析并执行 message.tool_calls，返回 tool 角色消息列表。"""
@@ -623,14 +751,24 @@ class Agent:
                 delta,cost = self._record_usage(response.usage)
 
             message = response.choices[0].message
-
+            finish_reason = response.choices[0].finish_reason
 
             self.openai_messages.append(
                 message.model_dump(exclude_none=True)
             )
 
+            if finish_reason == "length" and message.tool_calls:
+                # 参数可能不完整，不执行；补 tool 消息保证历史合法
+                self.openai_messages.extend(
+                    self._interrupted_tool_messages(message.tool_calls, finish_reason)
+                )
+                print("输出达到长度上限，工具调用未执行，请重试。")
+                continue
+
             if not message.tool_calls:
                 print("AI: ", message.content or "")
+                if finish_reason == "length":
+                    print("输出达到长度上限，回答可能不完整。")
                 self.show_usage()
                 # 开始下一轮之前，清空本轮统计
                 self.turn_usage = TokenUsage()
@@ -658,12 +796,18 @@ class Agent:
                 print(f"已达到最大轮数（{self.max_turns}），强制停止。")
                 return
 
+            truncated = False
             try:
                 response = self.call_openai_stream(
                     messages = self.openai_messages,
                     tools= self.tools,
                     on_text=print_text_delta
                 )
+            except LengthFinishReasonError as e:
+                # 输出达到长度上限时 SDK 不返回 completion，而是抛异常；
+                # 真实 usage 和已生成内容都在异常对象里，不能丢
+                response = e.completion
+                truncated = True
             except KeyboardInterrupt:
                 console.print()
                 print("已中断本轮对话")
@@ -687,6 +831,17 @@ class Agent:
             #流式文本可能没有以换行结尾，后面接工具输出/usage 前补一个换行
             if message.content:
                 console.print()
+
+            if truncated and message.tool_calls:
+                # 参数可能不完整，不执行；但必须补 tool 消息，否则历史非法
+                self.openai_messages.extend(
+                    self._interrupted_tool_messages(message.tool_calls, "length")
+                )
+                print("输出达到长度上限，工具调用未执行，请重试。")
+                continue
+
+            if truncated:
+                print("输出达到长度上限，回答可能不完整。")
 
             if not message.tool_calls:
                 self.show_usage()

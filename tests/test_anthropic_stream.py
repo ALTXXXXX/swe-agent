@@ -329,6 +329,125 @@ def test_non_safe_tool_executes_after_stream(monkeypatch, ui):
     assert "晴朗" in content[0]["content"]
 
 
+def test_truncated_stream_answers_tool_use_without_executing(monkeypatch, ui):
+    """生成被截断（stop_reason=max_tokens）时：
+    不执行工具，但必须补一条 tool_result，保证历史合法。
+    """
+    original_write = tools.tool_handlers["write_file"]
+    calls = []
+
+    def counting_write(file_path, content):
+        calls.append(file_path)
+        return original_write(file_path, content)
+
+    monkeypatch.setitem(tools.tool_handlers, "write_file", counting_write)
+
+    msg1 = _message(
+        "msg_1",
+        [
+            {
+                "type": "tool_use",
+                "id": "toolu_cut",
+                "name": "write_file",
+                "input": {"file_path": "x.txt", "content": "partial"},
+            }
+        ],
+        "max_tokens",
+    )
+    msg2 = _message("msg_2", [{"type": "text", "text": "ok"}], "end_turn")
+
+    stream1 = FakeStream(
+        [_event("message_start", message=None)]
+        + _tool_block(
+            0,
+            "toolu_cut",
+            "write_file",
+            {"file_path": "x.txt", "content": "partial"},
+        )
+        + [_event("message_stop")],
+        msg1,
+    )
+    stream2 = FakeStream(
+        [_event("message_start", message=None)]
+        + _text_block(0, "ok")
+        + [_event("message_stop")],
+        msg2,
+    )
+
+    agent = _make_agent(monkeypatch, [stream1, stream2])
+    _run(agent._chat_anthropic_stream("写文件"))
+
+    assert calls == [], "被截断的工具调用不应执行"
+
+    assistant_index = next(
+        i
+        for i, message in enumerate(agent.anthropic_messages)
+        if message["role"] == "assistant"
+        and any(
+            block.get("type") == "tool_use"
+            for block in message["content"]
+        )
+    )
+    result_message = agent.anthropic_messages[assistant_index + 1]
+    assert result_message["role"] == "user"
+    first_block = result_message["content"][0]
+    assert first_block["type"] == "tool_result"
+    assert first_block["tool_use_id"] == "toolu_cut"
+    assert "未完成" in first_block["content"]
+
+
+def test_repair_history_fills_missing_tool_results(monkeypatch):
+    """历史中断在 tool_use 上时，修复逻辑要补出合法的 tool_result。"""
+    agent = _make_agent(monkeypatch, [])
+    agent.anthropic_messages = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "write_file",
+                    "input": {},
+                }
+            ],
+        },
+        {"role": "user", "content": "继续"},
+    ]
+
+    agent._repair_anthropic_history()
+
+    repaired = agent.anthropic_messages[2]["content"]
+    assert repaired[0]["type"] == "tool_result"
+    assert repaired[0]["tool_use_id"] == "toolu_1"
+    assert repaired[1] == {"type": "text", "text": "继续"}
+
+    # 再修一次不应重复插入
+    agent._repair_anthropic_history()
+    assert len(agent.anthropic_messages) == 3
+
+    # 悬空在历史结尾：直接补一条 user 消息
+    agent.anthropic_messages = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_2",
+                    "name": "write_file",
+                    "input": {},
+                }
+            ],
+        },
+    ]
+    agent._repair_anthropic_history()
+
+    tail = agent.anthropic_messages[-1]
+    assert tail["role"] == "user"
+    assert tail["content"][0]["tool_use_id"] == "toolu_2"
+
+
 def test_denied_safe_tool_is_not_executed(monkeypatch, tmp_path):
     f = tmp_path / "a.txt"
     f.write_text("AAA")
