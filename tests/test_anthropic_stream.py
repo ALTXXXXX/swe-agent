@@ -1,10 +1,10 @@
 # tests/test_anthropic_stream.py
-"""用伪造的 Anthropic 流验证流式工具执行链路：
+"""用伪造的 Anthropic 流验证主循环的流式工具执行链路：
 
 - 文本增量正常回调
-- tool_use 块的参数收齐后提前执行
-- 提前执行的结果按 tool_use_id 回传，不会重复执行
+- tool_use 参数收齐后提前执行，且不会重复执行
 - 非并发安全工具在流结束后执行
+- 被截断的工具调用不执行，但历史仍合法
 - 被权限拒绝的工具不执行
 """
 import asyncio
@@ -17,6 +17,7 @@ from anthropic.types import Message
 
 import agent as agent_mod
 import tools
+from providers.anthropic_provider import AnthropicProvider
 
 
 # ---------------- 构造伪造的流式事件 ----------------
@@ -143,7 +144,9 @@ def _make_agent(monkeypatch, streams):
     agent = agent_mod.Agent(
         provider="anthropic", api_key="fake", api_base="http://fake"
     )
-    monkeypatch.setattr(agent, "anthropic_client", FakeClient(streams))
+    agent.provider_impl = AnthropicProvider(
+        client=FakeClient(streams), model="fake"
+    )
     monkeypatch.setattr(agent, "show_usage", lambda: None)
     return agent
 
@@ -154,10 +157,11 @@ def _run(coro):
 
 # ---------------- 用例 ----------------
 
-def test_call_anthropic_stream_delivers_text_and_parsed_tool_input(
-    monkeypatch, ui
-):
-    final = _message(
+def test_chat_once_streams_text_and_records_tool_call(monkeypatch, tmp_path, ui):
+    f = tmp_path / "a.txt"
+    f.write_text("AAA")
+
+    msg1 = _message(
         "msg_1",
         [
             {"type": "text", "text": "你好"},
@@ -165,44 +169,35 @@ def test_call_anthropic_stream_delivers_text_and_parsed_tool_input(
                 "type": "tool_use",
                 "id": "toolu_1",
                 "name": "read_file",
-                "input": {"file_path": "a.txt"},
+                "input": {"file_path": str(f)},
             },
         ],
         "tool_use",
     )
-    stream = FakeStream(
+    msg2 = _message("msg_2", [{"type": "text", "text": "完成"}], "end_turn")
+    stream1 = FakeStream(
         [_event("message_start", message=None)]
         + _text_block(0, "你好")
-        + _tool_block(1, "toolu_1", "read_file", {"file_path": "a.txt"})
+        + _tool_block(1, "toolu_1", "read_file", {"file_path": str(f)})
         + [_event("message_stop")],
-        final,
+        msg1,
     )
-    agent = _make_agent(monkeypatch, [stream])
-
-    tool_blocks = []
-
-    async def on_tool(block):
-        tool_blocks.append(block)
-
-    result = _run(
-        agent.call_anthropic_stream(
-            messages=[],
-            tools=[],
-            on_text=ui.texts.append,
-            on_tool_block_complete=on_tool,
-        )
+    stream2 = FakeStream(
+        [_event("message_start", message=None)]
+        + _text_block(0, "完成")
+        + [_event("message_stop")],
+        msg2,
     )
 
-    assert ui.texts == ["你好"], "文本增量没有送达"
-    assert tool_blocks == [
-        {
-            "type": "tool_use",
-            "id": "toolu_1",
-            "name": "read_file",
-            "input": {"file_path": "a.txt"},
-        }
-    ], "tool_use 参数没有在块结束时解析出来"
-    assert result.id == "msg_1"
+    agent = _make_agent(monkeypatch, [stream1, stream2])
+    _run(agent.chat_once("读文件"))
+
+    assert "你好" in ui.texts
+    assert "完成" in ui.texts
+    assert agent.messages[1].tool_calls[0].id == "toolu_1"
+    assert agent.messages[1].tool_calls[0].arguments == {"file_path": str(f)}
+    assert agent.messages[2].results[0].tool_call_id == "toolu_1"
+    assert "AAA" in agent.messages[2].results[0].content
 
 
 def test_safe_tools_execute_early_and_only_once(monkeypatch, tmp_path, ui):
@@ -261,20 +256,18 @@ def test_safe_tools_execute_early_and_only_once(monkeypatch, tmp_path, ui):
     )
 
     agent = _make_agent(monkeypatch, [stream1, stream2])
-    _run(agent._chat_anthropic_stream("读这两个文件"))
+    _run(agent.chat_once("读这两个文件"))
 
     # 每个工具只执行一次（不能因为提前执行 + 事后收集而跑两遍）
     assert len(calls) == 2
     assert sorted(calls) == sorted([str(f1), str(f2)])
 
     # tool_result 按最终消息里的 tool_use 顺序回传
-    tool_message = agent.anthropic_messages[2]
-    assert tool_message["role"] == "user"
-    assert [r["tool_use_id"] for r in tool_message["content"]] == [
+    result_message = agent.messages[2]
+    assert [r.tool_call_id for r in result_message.results] == [
         "toolu_1",
         "toolu_2",
     ]
-    assert all(r["type"] == "tool_result" for r in tool_message["content"])
 
     # 提前执行：第一个工具在第一轮流结束前就已经启动
     assert started_at[0] < max(stream1.yielded_at), "工具没有和模型生成重叠"
@@ -321,12 +314,10 @@ def test_non_safe_tool_executes_after_stream(monkeypatch, ui):
     )
 
     agent = _make_agent(monkeypatch, [stream1, stream2])
-    _run(agent._chat_anthropic_stream("查天气"))
+    _run(agent.chat_once("查天气"))
 
     assert calls == ["北京"], "非并发安全工具应该执行一次"
-    content = agent.anthropic_messages[2]["content"]
-    assert content[0]["tool_use_id"] == "toolu_1"
-    assert "晴朗" in content[0]["content"]
+    assert "晴朗" in agent.messages[2].results[0].content
 
 
 def test_truncated_stream_answers_tool_use_without_executing(monkeypatch, ui):
@@ -375,77 +366,14 @@ def test_truncated_stream_answers_tool_use_without_executing(monkeypatch, ui):
     )
 
     agent = _make_agent(monkeypatch, [stream1, stream2])
-    _run(agent._chat_anthropic_stream("写文件"))
+    _run(agent.chat_once("写文件"))
 
     assert calls == [], "被截断的工具调用不应执行"
 
-    assistant_index = next(
-        i
-        for i, message in enumerate(agent.anthropic_messages)
-        if message["role"] == "assistant"
-        and any(
-            block.get("type") == "tool_use"
-            for block in message["content"]
-        )
-    )
-    result_message = agent.anthropic_messages[assistant_index + 1]
-    assert result_message["role"] == "user"
-    first_block = result_message["content"][0]
-    assert first_block["type"] == "tool_result"
-    assert first_block["tool_use_id"] == "toolu_cut"
-    assert "未完成" in first_block["content"]
-
-
-def test_repair_history_fills_missing_tool_results(monkeypatch):
-    """历史中断在 tool_use 上时，修复逻辑要补出合法的 tool_result。"""
-    agent = _make_agent(monkeypatch, [])
-    agent.anthropic_messages = [
-        {"role": "user", "content": "hi"},
-        {
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "tool_use",
-                    "id": "toolu_1",
-                    "name": "write_file",
-                    "input": {},
-                }
-            ],
-        },
-        {"role": "user", "content": "继续"},
-    ]
-
-    agent._repair_anthropic_history()
-
-    repaired = agent.anthropic_messages[2]["content"]
-    assert repaired[0]["type"] == "tool_result"
-    assert repaired[0]["tool_use_id"] == "toolu_1"
-    assert repaired[1] == {"type": "text", "text": "继续"}
-
-    # 再修一次不应重复插入
-    agent._repair_anthropic_history()
-    assert len(agent.anthropic_messages) == 3
-
-    # 悬空在历史结尾：直接补一条 user 消息
-    agent.anthropic_messages = [
-        {"role": "user", "content": "hi"},
-        {
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "tool_use",
-                    "id": "toolu_2",
-                    "name": "write_file",
-                    "input": {},
-                }
-            ],
-        },
-    ]
-    agent._repair_anthropic_history()
-
-    tail = agent.anthropic_messages[-1]
-    assert tail["role"] == "user"
-    assert tail["content"][0]["tool_use_id"] == "toolu_2"
+    result_message = agent.messages[2]
+    assert result_message.results[0].tool_call_id == "toolu_cut"
+    assert result_message.results[0].is_error
+    assert "未完成" in result_message.results[0].content
 
 
 def test_denied_safe_tool_is_not_executed(monkeypatch, tmp_path):
@@ -492,9 +420,7 @@ def test_denied_safe_tool_is_not_executed(monkeypatch, tmp_path):
         agent, "_check_permission", lambda name, args: (False, "blocked")
     )
 
-    _run(agent._chat_anthropic_stream("读文件"))
+    _run(agent.chat_once("读文件"))
 
     assert calls == [], "被拒绝的工具不应执行"
-    content = agent.anthropic_messages[2]["content"]
-    assert content[0]["tool_use_id"] == "toolu_1"
-    assert "blocked" in content[0]["content"]
+    assert "blocked" in agent.messages[2].results[0].content

@@ -19,7 +19,11 @@
       "WebFetch(domain:api-docs.deepseek.com)",
       "Bash(.venv/Scripts/python.exe -m pytest tests/test_openai_stream.py -q)",
       "Bash(.venv/Scripts/python.exe -m pytest tests/ -q)",
-      "Bash(.venv/Scripts/python.exe -m py_compile agent.py tests/test_openai_stream.py)"
+      "Bash(.venv/Scripts/python.exe -m py_compile agent.py tests/test_openai_stream.py)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests -q)",
+      "Bash(.venv/Scripts/python.exe -c \"import openai, anthropic; print\\('openai', openai.__version__\\); print\\('anthropic', anthropic.__version__\\)\")",
+      "Bash(git check-ignore *)",
+      "Bash(.venv/Scripts/python.exe -c ' *)"
     ]
   }
 }
