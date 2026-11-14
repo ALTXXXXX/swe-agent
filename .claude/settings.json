@@ -26,7 +26,11 @@
       "Bash(.venv/Scripts/python.exe -c ' *)",
       "Bash(python -c \"print\\(len\\(open\\('tests/d.txt','rb'\\).read\\(\\)\\)\\)\")",
       "Bash(pip show *)",
-      "Bash(python -m py_compile context.py agent.py)"
+      "Bash(python -m py_compile context.py agent.py)",
+      "Bash(python -m pyflakes agent.py context.py)",
+      "Bash(python -c \"import agent, context; print\\('import OK'\\)\")",
+      "Bash(set -e)",
+      "Bash(git switch *)"
     ]
   }
 }
