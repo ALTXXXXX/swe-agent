@@ -14,3 +14,6 @@ CLAUDE.md
 PROJECT_BRIEF.md
 tests/
 .mini-agent/
+
+# Claude Code 配置（含本机权限审批，不共享）
+.claude/
