@@ -3,7 +3,18 @@
 from pathlib import Path
 from permissions import chek_permission
 import sys
-from context import tool_result_budget
+from context import (
+    tool_result_budget,
+    micro_compact,
+    estimate_tokens,
+    compact_keep_index,
+    render_transcript,
+    write_transcript,
+    SUMMARY_SYSTEM_PROMPT,
+    COMPACT_TRIGGER_TOKENS,
+    COMPACT_KEEP_RECENT_TURNS,
+    MAX_COMPACT_FAILURES,
+)
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
@@ -120,6 +131,7 @@ class Agent:
         self.cache_read_tokens = 0
         self.cache_write_tokens = 0
         self.output_tokens = 0
+        self.compact_failures = 0   # 连续压缩失败次数（熔断）
 
         # 唯一的会话历史：规范化消息 IR
         self.messages: list[Message] = []
@@ -248,9 +260,50 @@ class Agent:
         self.turn_cost_usd = 0.0
         return history_len
 
+    async def _summarize(self, messages: list[Message]) -> str:
+        """把旧历史压成摘要（1 次 API 调用）。"""
+        turn = await self.provider_impl.generate(
+            system=SUMMARY_SYSTEM_PROMPT,
+            messages=[Message.user(render_transcript(messages))],
+            tools=self.tool_schema,
+            stream=False,
+        )
+        summary = turn.message.text().strip()
+        if not summary:
+            raise RuntimeError("摘要结果为空")
+        return summary
+
+    async def _maybe_compact(self) -> None:
+        """接近窗口阈值时：落盘 transcript → LLM 摘要 → 摘要 + 最近 N 轮。"""
+        if estimate_tokens(self.messages) < COMPACT_TRIGGER_TOKENS:
+            return
+        if self.compact_failures >= MAX_COMPACT_FAILURES:
+            return
+        keep_from = compact_keep_index(self.messages, COMPACT_KEEP_RECENT_TURNS)
+        if keep_from is None:
+            return
+        try:
+            path = write_transcript(self.session_id, self.messages)
+            summary = await self._summarize(self.messages[:keep_from])
+            self.messages[:] = (
+                [Message.user(f"[Compacted]\n\n{summary}")]
+                + self.messages[keep_from:]
+            )
+            self.compact_failures = 0
+            console.print(f"[dim]◈ Context compacted · transcript: {path}[/dim]")
+        except Exception as e:
+            self.compact_failures += 1
+            print(
+                f"警告：上下文压缩失败"
+                f"（{self.compact_failures}/{MAX_COMPACT_FAILURES}）：{e}"
+            )
+
     async def chat_once(self, user_message: str) -> None:
         # 每次对话开始前修复缺结果的工具调用：两家 API 都要求历史合法
         fill_missing_tool_results(self.messages)
+
+        # 上下文接近窗口上限时，先把历史压成摘要再开始新一轮
+        await self._maybe_compact()
 
         history_len = self._begin_turn(user_message)
 
@@ -282,7 +335,8 @@ class Agent:
 
                 )
             #大结果落盘
-            # tool_result_budget(self.messages)
+            tool_result_budget(self.messages)
+            micro_compact(self.messages)
             try:
                 try:
                     turn = await self.provider_impl.generate(
