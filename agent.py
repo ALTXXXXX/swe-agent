@@ -3,6 +3,7 @@
 from pathlib import Path
 from permissions import chek_permission
 import sys
+from context import tool_result_budget
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
@@ -222,7 +223,7 @@ class Agent:
         decision = chek_permission(tool_name, arguments, self.permission_mode)
         action = decision.get("action", "deny")
         message = decision.get("message") or tool_name
-
+ 
         if action == "allow":
             return True, ""
         if action == "deny":
@@ -278,8 +279,10 @@ class Agent:
                 print_tool_call(call.name, arguments)
                 early_tasks[call.id] = asyncio.create_task(
                     execute_tool(call.name, arguments)
-                )
 
+                )
+            #大结果落盘
+            # tool_result_budget(self.messages)
             try:
                 try:
                     turn = await self.provider_impl.generate(

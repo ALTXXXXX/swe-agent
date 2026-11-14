@@ -13,3 +13,4 @@ tools/
 CLAUDE.md
 PROJECT_BRIEF.md
 tests/
+.mini-agent/

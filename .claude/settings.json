@@ -23,7 +23,10 @@
       "Bash(.venv/Scripts/python.exe -m pytest tests -q)",
       "Bash(.venv/Scripts/python.exe -c \"import openai, anthropic; print\\('openai', openai.__version__\\); print\\('anthropic', anthropic.__version__\\)\")",
       "Bash(git check-ignore *)",
-      "Bash(.venv/Scripts/python.exe -c ' *)"
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Bash(python -c \"print\\(len\\(open\\('tests/d.txt','rb'\\).read\\(\\)\\)\\)\")",
+      "Bash(pip show *)",
+      "Bash(python -m py_compile context.py agent.py)"
     ]
   }
 }
